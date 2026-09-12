@@ -24,8 +24,8 @@ x      = "exec:legion-osk toggle"
 y      = "key:KEY_ENTER"
 
 # Shoulders and triggers.
-lb     = "exec:hyprctl dispatch workspace e-1"
-rb     = "exec:hyprctl dispatch workspace e+1"
+lb     = "exec:hyprctl dispatch 'hl.dsp.focus({ workspace = \"e-1\" })'"
+rb     = "exec:hyprctl dispatch 'hl.dsp.focus({ workspace = \"e+1\" })'"
 lt     = "key:KEY_ESC"
 rt     = "exec:omarchy menu toggle window"
 

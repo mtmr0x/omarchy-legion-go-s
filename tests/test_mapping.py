@@ -118,7 +118,7 @@ print("\n6. exec actions fire on press only")
 nav.spawned.clear()
 nav.handle_event(ev(e.EV_KEY, e.BTN_TR, 1))
 nav.handle_event(ev(e.EV_KEY, e.BTN_TR, 0))
-check("spawned", nav.spawned, ["hyprctl dispatch workspace e+1"])
+check("spawned", nav.spawned, ["hyprctl dispatch 'hl.dsp.focus({ workspace = \"e+1\" })'"])
 
 print("\n7. left stick moves the cursor")
 ptr.log.clear()
