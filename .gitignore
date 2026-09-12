@@ -1,0 +1,5 @@
+# Capture logs from tools/inputcapture.py
+inputcapture-*.log
+
+# Timestamped backups made by install.sh / uninstall.sh
+*.bak.*

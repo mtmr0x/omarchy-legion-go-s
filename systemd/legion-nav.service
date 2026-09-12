@@ -1,0 +1,17 @@
+[Unit]
+Description=Legion Go S gamepad desktop navigation
+Documentation=https://github.com/mat/omarchy-legion-go-s
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/legion-nav daemon
+Restart=on-failure
+RestartSec=2
+# The pad is read at 200 Hz and drives the cursor; keep it off the back burner.
+Nice=-5
+Slice=session.slice
+
+[Install]
+WantedBy=graphical-session.target

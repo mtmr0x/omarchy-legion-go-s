@@ -1,0 +1,739 @@
+#!/usr/bin/env python3
+"""legion-config - see and change the Legion Go S mapping.
+
+Draws the device, shows what every control does, and lets you change bindings
+and feel. Changes apply to the running daemon immediately, so cursor speed and
+the scroll safeguards can be tuned by feel rather than by guesswork, and are
+only written to disk when you save.
+
+Navigable from the gamepad itself: the D-pad sends arrows, Y sends Enter and LT
+sends Escape, and the daemon suppresses everything else while this is open.
+
+    legion-config           # the UI
+    legion-config --print   # the diagram and mapping as plain text
+"""
+from __future__ import annotations
+
+import argparse
+import copy
+import curses
+import importlib.util
+import json
+import os
+import re
+import shutil
+import socket
+import sys
+import time
+
+# --------------------------------------------------------------------------- daemon module
+
+def load_daemon_module():
+    """Import bin/legion-nav so we share its Action parser and catalogue.
+
+    Resolving through realpath matters: ~/.local/bin/legion-config is a symlink
+    into the repo, and the sibling we want is next to the real file.
+    """
+    here = os.path.dirname(os.path.realpath(__file__))
+    path = os.path.join(here, "legion-nav")
+    spec = importlib.util.spec_from_loader("legion_nav", loader=None)
+    module = importlib.util.module_from_spec(spec)
+    module.__file__ = path
+    source = open(path).read().replace(
+        'if __name__ == "__main__":\n    sys.exit(main())', "")
+    exec(compile(source, path, "exec"), module.__dict__)
+    return module
+
+
+LN = load_daemon_module()
+
+CONTROLS = [
+    ("a", "A"), ("b", "B"), ("x", "X"), ("y", "Y"),
+    ("lb", "LB"), ("rb", "RB"), ("lt", "LT"), ("rt", "RT"),
+    ("l3", "L3 (left stick click)"), ("r3", "R3 (right stick click)"),
+    ("start", "Start"), ("select", "Select"), ("legion", "Legion"),
+    ("dpad_up", "D-pad up"), ("dpad_down", "D-pad down"),
+    ("dpad_left", "D-pad left"), ("dpad_right", "D-pad right"),
+]
+CONTROL_NAMES = [name for name, _ in CONTROLS]
+
+# Which TOML table each control lives in.
+def section_of(control: str) -> tuple[str, str]:
+    if control.startswith("dpad_"):
+        return "dpad_keys", control[len("dpad_"):]
+    return "buttons", control
+
+
+FEEL = [
+    # (section, key, label, min, max, step, unit)
+    ("cursor", "max_speed", "Cursor speed", 200.0, 4000.0, 50.0, "px/s"),
+    ("cursor", "deadzone", "Cursor deadzone", 0.0, 0.5, 0.01, "%"),
+    ("cursor", "expo", "Cursor curve", 1.0, 4.0, 0.1, ""),
+    ("cursor", "precision_factor", "Precision factor", 0.05, 1.0, 0.05, "%"),
+    ("cursor", "tick_hz", "Polling rate", 60, 250, 10, "Hz"),
+    ("scroll", "enabled", "Scroll enabled", 0, 1, 1, "bool"),
+    ("scroll", "deadzone", "Scroll deadzone", 0.1, 0.8, 0.01, "%"),
+    ("scroll", "engage_ms", "Scroll engage delay", 0, 600, 25, "ms"),
+    ("scroll", "max_speed", "Scroll speed", 2.0, 60.0, 1.0, "notch/s"),
+    ("scroll", "natural", "Natural scroll", 0, 1, 1, "bool"),
+    ("triggers", "press_at", "Trigger press at", 0.1, 0.9, 0.05, "%"),
+    ("triggers", "release_at", "Trigger release at", 0.05, 0.85, 0.05, "%"),
+    ("modes", "mode_hold_seconds", "Legion hold time", 0.2, 2.0, 0.1, "s"),
+]
+
+# --------------------------------------------------------------------------- diagram
+
+LABELS = {
+    "lb": "LB", "rb": "RB", "lt": "LT", "rt": "RT",
+    "dpad_up": "▲", "dpad_down": "▼", "dpad_left": "◄", "dpad_right": "►",
+    "y": "Y", "x": "X", "b": "B", "a": "A",
+    "select": "SEL", "start": "STA", "legion": "LGN",
+    "l3": "L3", "r3": "R3",
+}
+
+# Rows are padded to a common width at render time via the {~} (spaces) and
+# {-} (dashes) stretch tokens, so the art cannot drift out of alignment when a
+# label changes length. Nothing here is hand-counted.
+TEMPLATE = [
+    "     {lb}{~}{rb}     ",
+    "     {lt}{~}{rt}     ",
+    "   ╭{-}╮   ",
+    "   │  {dpad_up}{~}{y}{~}  │   ",
+    "   │ {dpad_left} {dpad_right}{~}{x}   {b}{~} │   ",
+    "   │  {dpad_down}{~}{a}{~}  │   ",
+    "   │ {l3}{~}{select}  {legion}  {start}{~}{r3} │   ",
+    "   ╰{-}╯   ",
+]
+
+# Minimum interior width, so the art never collapses into a cramped row.
+MIN_DIAGRAM_WIDTH = 40
+
+_TOKEN = re.compile(r"\{([a-z0-9_~-]+)\}")
+
+
+def _segments(template: str):
+    """Split a template row into (literal_or_label, control_or_None) parts."""
+    parts, index = [], 0
+    for match in _TOKEN.finditer(template):
+        if match.start() > index:
+            parts.append((template[index:match.start()], None))
+        parts.append((match.group(1), "token"))
+        index = match.end()
+    if index < len(template):
+        parts.append((template[index:], None))
+    return parts
+
+
+def render_diagram() -> tuple[list[str], dict[str, tuple[int, int, int]]]:
+    """Return the diagram lines plus the (row, col, width) span of each control.
+
+    Two passes: measure every row with the stretch tokens empty, then re-render
+    padding each row out to the widest. Spans are recorded during the second
+    pass, so they always describe the text actually drawn.
+    """
+    rows = [_segments(t) for t in TEMPLATE]
+
+    def width_without_stretch(parts) -> int:
+        total = 0
+        for text, kind in parts:
+            if kind is None:
+                total += len(text)
+            elif text not in ("~", "-"):
+                total += len(LABELS[text])
+        return total
+
+    target = max(MIN_DIAGRAM_WIDTH,
+                 max(width_without_stretch(parts) for parts in rows))
+
+    lines: list[str] = []
+    spans: dict[str, tuple[int, int, int]] = {}
+    for row, parts in enumerate(rows):
+        stretches = sum(1 for text, kind in parts if kind and text in ("~", "-"))
+        fill = target - width_without_stretch(parts)
+        # Spread the slack evenly; the leftmost gaps absorb the remainder.
+        share, extra = divmod(fill, max(1, stretches))
+        used = 0
+        out = ""
+        for text, kind in parts:
+            if kind is None:
+                out += text
+            elif text in ("~", "-"):
+                used += 1
+                size = share + (1 if used <= extra else 0)
+                out += (" " if text == "~" else "─") * size
+            else:
+                label = LABELS[text]
+                spans[text] = (row, len(out), len(label))
+                out += label
+        lines.append(out)
+    return lines, spans
+
+
+# --------------------------------------------------------------------------- toml writing
+
+def format_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        text = f"{round(value, 4):g}"
+        return text if ("." in text or "e" in text) else text + ".0"
+    return json.dumps(str(value))
+
+
+def set_in_toml(text: str, section: str, key: str, value) -> str:
+    """Replace one key's value in place, preserving comments and alignment.
+
+    The shipped config is mostly explanatory comments, and they are the real
+    documentation for every knob -- regenerating the file from a dict would
+    throw all of that away. tomllib is read-only and stdlib has no writer, so
+    this patches the single line instead.
+    """
+    lines = text.splitlines(keepends=True)
+    formatted = format_value(value)
+
+    header = re.compile(r"^\[" + re.escape(section) + r"\]\s*$")
+    start = next((i for i, line in enumerate(lines) if header.match(line)), None)
+    if start is None:
+        ending = "" if text.endswith("\n") else "\n"
+        return text + f"{ending}\n[{section}]\n{key} = {formatted}\n"
+
+    stop = len(lines)
+    for i in range(start + 1, len(lines)):
+        if lines[i].lstrip().startswith("["):
+            stop = i
+            break
+
+    # A leading '#' stops this matching, so commented-out examples are safe.
+    entry = re.compile(r"^(\s*)(" + re.escape(key) + r")(\s*)=(\s*)(.*)$")
+    for i in range(start + 1, stop):
+        match = entry.match(lines[i].rstrip("\n"))
+        if match:
+            indent, name, pad, after_eq, _ = match.groups()
+            newline = "\n" if lines[i].endswith("\n") else ""
+            lines[i] = f"{indent}{name}{pad}={after_eq or ' '}{formatted}{newline}"
+            return "".join(lines)
+
+    lines.insert(start + 1, f"{key} = {formatted}\n")
+    return "".join(lines)
+
+
+# --------------------------------------------------------------------------- daemon client
+
+def daemon(command: str) -> str | None:
+    """Send one control-socket command. None means the daemon is not running."""
+    path = os.path.join(
+        os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "legion-nav.sock")
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(1.0)
+            sock.connect(path)
+            sock.sendall(command.encode() + b"\n")
+            return sock.recv(65536).decode().strip()
+    except OSError:
+        return None
+
+
+def user_config_path() -> str:
+    return os.path.expanduser("~/.config/legion-nav/config.toml")
+
+
+def ensure_user_config() -> str:
+    """Make sure a user config exists, seeding it from the repo default."""
+    path = user_config_path()
+    if not os.path.exists(path):
+        here = os.path.dirname(os.path.realpath(__file__))
+        default = os.path.join(os.path.dirname(here), "config", "legion-nav.toml")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        shutil.copy(default, path)
+    return path
+
+
+def describe(spec: str) -> str:
+    """Human label for an action spec, falling back to the spec itself."""
+    for label, known in ACTION_CATALOG:
+        if known == spec:
+            return label
+    if not spec or spec == "none":
+        return "Nothing"
+    kind, _, value = spec.partition(":")
+    if kind == "exec":
+        return value
+    return value or spec
+
+
+ACTION_CATALOG = LN.ACTION_CATALOG
+
+
+def binding_of(cfg: dict, control: str) -> str:
+    section, key = section_of(control)
+    return cfg.get(section, {}).get(key, "none")
+
+
+# --------------------------------------------------------------------------- plain output
+
+def print_mapping(cfg: dict) -> None:
+    lines, _ = render_diagram()
+    print()
+    for line in lines:
+        print("  " + line)
+    print()
+    width = max(len(label) for _, label in CONTROLS)
+    for control, label in CONTROLS:
+        print(f"  {label:<{width}}  {describe(binding_of(cfg, control))}")
+    print()
+    cursor, scroll = cfg["cursor"], cfg["scroll"]
+    print(f"  Cursor  {cursor['max_speed']:g} px/s   deadzone {cursor['deadzone']:.0%}"
+          f"   curve {cursor['expo']:g}   precision {cursor['precision_factor']:.0%}")
+    state = "on" if scroll.get("enabled") else "off"
+    print(f"  Scroll  {state}   deadzone {scroll['deadzone']:.0%}"
+          f"   engage {scroll['engage_ms']} ms   {scroll['max_speed']:g} notch/s")
+    print()
+
+
+# --------------------------------------------------------------------------- theme
+
+def hex_to_xterm(value: str | None) -> int | None:
+    """Nearest xterm-256 index for a #rrggbb colour, or None."""
+    if not value:
+        return None
+    text = value.strip().strip('"').lstrip("#")
+    if len(text) != 6:
+        return None
+    try:
+        r, g, b = (int(text[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return None
+
+    def cube(channel: int) -> int:
+        return min(range(6), key=lambda i: abs([0, 95, 135, 175, 215, 255][i] - channel))
+
+    cube_index = 16 + 36 * cube(r) + 6 * cube(g) + cube(b)
+    cube_rgb = [[0, 95, 135, 175, 215, 255][cube(c)] for c in (r, g, b)]
+    grey_level = min(range(24), key=lambda i: abs((8 + i * 10) - (r + g + b) // 3))
+    grey_rgb = [8 + grey_level * 10] * 3
+    dist = lambda a: sum((x - y) ** 2 for x, y in zip(a, (r, g, b)))
+    return cube_index if dist(cube_rgb) <= dist(grey_rgb) else 232 + grey_level
+
+
+def theme_colors() -> dict[str, int | None]:
+    """Borrow Omarchy's gum theme, which is already exported into the session.
+
+    Omarchy generates ~110 GUM_* variables per theme, so reading them keeps this
+    UI in step with whatever theme is active without a config of its own.
+    """
+    env = os.environ.get
+    return {
+        "fg": hex_to_xterm(env("FOREGROUND")),
+        "accent": hex_to_xterm(env("GUM_CHOOSE_CURSOR_FOREGROUND") or env("BORDER_FOREGROUND")),
+        "muted": hex_to_xterm(env("GUM_CHOOSE_SELECTED_BACKGROUND") or env("BORDER")),
+    }
+
+
+# --------------------------------------------------------------------------- ui
+
+TABS = ("Buttons", "Feel")
+ACTIONS = ("Save", "Revert", "Quit")
+
+
+def format_feel(entry, value) -> str:
+    _section, _key, _label, _low, _high, _step, unit = entry
+    if unit == "bool":
+        return "on" if value else "off"
+    if unit == "%":
+        return f"{value:.0%}"
+    if unit:
+        return f"{value:g} {unit}"
+    return f"{value:g}"
+
+
+class App:
+    def __init__(self, screen, cfg: dict, path: str):
+        self.screen = screen
+        self.cfg = cfg
+        self.path = path
+        self.saved = json.loads(json.dumps(cfg))
+        self.tab = 0
+        self.rows = {0: 0, 1: 0}
+        self.focus = "list"
+        self.action = 0
+        self.dirty = False
+        self.message = ""
+        self.live = daemon("status") is not None
+        if not self.live:
+            self.message = "daemon not running - edits will be saved but not previewed"
+
+    # -- helpers -----------------------------------------------------------
+
+    def items(self) -> list:
+        return CONTROLS if self.tab == 0 else FEEL
+
+    def push(self, section: str, key: str, value) -> None:
+        self.cfg.setdefault(section, {})[key] = value
+        self.dirty = True
+        if self.live:
+            reply = daemon(f"set {section}.{key} {value}")
+            if reply and reply.startswith("error"):
+                self.message = reply
+
+    # -- drawing -----------------------------------------------------------
+
+    def draw(self) -> None:
+        screen = self.screen
+        screen.erase()
+        height, width = screen.getmaxyx()
+        pair = lambda n: curses.color_pair(n)
+
+        title = "legion-nav · configure"
+        state = "● unsaved" if self.dirty else "saved"
+        screen.addnstr(0, 1, title, width - 2, pair(1) | curses.A_BOLD)
+        if width > len(title) + len(state) + 4:
+            screen.addstr(0, width - len(state) - 2, state,
+                          pair(2) if self.dirty else pair(3))
+
+        row = 2
+        lines, spans = render_diagram()
+        if height >= 20 and width >= len(lines[0]) + 4:
+            left = max(1, (width - len(lines[0])) // 2)
+            selected = None
+            if self.tab == 0 and self.focus == "list":
+                selected = CONTROLS[self.rows[0]][0]
+            for offset, line in enumerate(lines):
+                screen.addnstr(row + offset, left, line, width - left - 1, pair(3))
+            if selected and selected in spans:
+                srow, scol, size = spans[selected]
+                screen.addnstr(row + srow, left + scol, LABELS[selected], size,
+                               pair(1) | curses.A_REVERSE | curses.A_BOLD)
+            row += len(lines) + 1
+
+        # Tab bar.
+        col = 2
+        for index, name in enumerate(TABS):
+            style = pair(1) | curses.A_BOLD if index == self.tab else pair(3)
+            if self.focus == "tabs" and index == self.tab:
+                style |= curses.A_REVERSE
+            screen.addnstr(row, col, f" {name} ", width - col - 1, style)
+            col += len(name) + 3
+        row += 1
+
+        # Reserve the footer: blank, actions, help, message.
+        footer = 4
+        visible = max(1, height - row - footer)
+        items = self.items()
+        cursor = self.rows[self.tab]
+        top = max(0, min(cursor - visible // 2, len(items) - visible))
+        top = max(0, top)
+
+        for offset in range(min(visible, len(items) - top)):
+            index = top + offset
+            focused = index == cursor and self.focus == "list"
+            style = pair(1) | curses.A_REVERSE if focused else pair(3)
+            if self.tab == 0:
+                control, label = items[index]
+                text = f" {label:<24} {describe(binding_of(self.cfg, control))}"
+            else:
+                entry = items[index]
+                section, key, label = entry[0], entry[1], entry[2]
+                value = self.cfg[section][key]
+                low, high = entry[3], entry[4]
+                if entry[6] == "bool":
+                    bar = "  [on] " if value else " [off] "
+                else:
+                    filled = int(round((float(value) - low) / (high - low) * 10))
+                    bar = "▮" * max(0, min(10, filled)) + "▯" * (10 - max(0, min(10, filled)))
+                text = f" {label:<24} {bar}  {format_feel(entry, value)}"
+            screen.addnstr(row + offset, 1, text.ljust(width - 2), width - 2, style)
+        row += visible + 1
+
+        col = 2
+        for index, name in enumerate(ACTIONS):
+            style = pair(1) | curses.A_REVERSE if (
+                self.focus == "actions" and index == self.action) else pair(3)
+            screen.addnstr(row, col, f" {name} ", width - col - 1, style)
+            col += len(name) + 3
+        row += 1
+
+        help_text = {
+            "tabs": "←→ switch tab   ↓ to the list   q quit",
+            "list": ("↑↓ move   ⏎ change   esc back   ↓ past the end for Save"
+                     if self.tab == 0 else
+                     "↑↓ move   ←→ adjust   ⏎ toggle   esc back   ↓ for Save"),
+            "actions": "←→ pick   ⏎ do it   esc back",
+        }[self.focus]
+        screen.addnstr(row, 2, help_text[:width - 4], width - 4, pair(4))
+        if self.message:
+            screen.addnstr(row + 1, 2, self.message[:width - 4], width - 4, pair(2))
+        screen.noutrefresh()
+        curses.doupdate()
+
+    # -- modals ------------------------------------------------------------
+
+    def pick_action(self, control: str) -> str | None:
+        """Curated action list plus a Custom escape hatch. None = cancelled."""
+        options = list(ACTION_CATALOG) + [("Custom…", None)]
+        current = binding_of(self.cfg, control)
+        index = next((i for i, (_, spec) in enumerate(options) if spec == current), 0)
+
+        while True:
+            height, width = self.screen.getmaxyx()
+            box_h = min(len(options) + 4, height - 2)
+            box_w = min(46, width - 4)
+            top, left = (height - box_h) // 2, (width - box_w) // 2
+            window = curses.newwin(box_h, box_w, top, left)
+            window.keypad(True)
+            window.erase()
+            window.box()
+            label = dict(CONTROLS)[control]
+            window.addnstr(0, 2, f" {label} ", box_w - 4, curses.color_pair(1) | curses.A_BOLD)
+
+            visible = box_h - 4
+            start = max(0, min(index - visible // 2, len(options) - visible))
+            for offset in range(min(visible, len(options) - start)):
+                i = start + offset
+                name, spec = options[i]
+                mark = "•" if spec == current else " "
+                style = curses.color_pair(1) | curses.A_REVERSE if i == index else curses.color_pair(3)
+                window.addnstr(offset + 2, 2, f"{mark} {name}".ljust(box_w - 4),
+                               box_w - 4, style)
+            window.addnstr(box_h - 1, 2, " ⏎ choose · esc cancel ", box_w - 4,
+                           curses.color_pair(4))
+            window.refresh()
+
+            key = window.getch()
+            if key in (curses.KEY_UP,):
+                index = (index - 1) % len(options)
+            elif key in (curses.KEY_DOWN,):
+                index = (index + 1) % len(options)
+            elif key == 27 or key == ord("q"):
+                return None
+            elif key in (10, 13, curses.KEY_ENTER):
+                name, spec = options[index]
+                if spec is not None:
+                    return spec
+                return self.prompt(f"{label} — action spec", current)
+
+    def prompt(self, title: str, initial: str) -> str | None:
+        """One-line editor, validated through the daemon's own Action parser."""
+        text = initial
+        while True:
+            height, width = self.screen.getmaxyx()
+            box_w = min(64, width - 4)
+            window = curses.newwin(6, box_w, (height - 6) // 2, (width - box_w) // 2)
+            window.keypad(True)
+            window.erase()
+            window.box()
+            window.addnstr(0, 2, f" {title} ", box_w - 4, curses.color_pair(1) | curses.A_BOLD)
+            window.addnstr(2, 2, text[-(box_w - 5):].ljust(box_w - 4), box_w - 4,
+                           curses.color_pair(1) | curses.A_UNDERLINE)
+            window.addnstr(4, 2, " key:KEY_X · btn:BTN_X · exec:cmd · none ", box_w - 4,
+                           curses.color_pair(4))
+            window.refresh()
+
+            key = window.getch()
+            if key == 27:
+                return None
+            if key in (10, 13, curses.KEY_ENTER):
+                try:
+                    LN.Action(text)          # same validation the daemon applies
+                except ValueError as exc:
+                    self.message = str(exc)
+                    return None
+                return text
+            if key in (curses.KEY_BACKSPACE, 127, 8):
+                text = text[:-1]
+            elif 32 <= key < 127:
+                text += chr(key)
+
+    # -- commands ----------------------------------------------------------
+
+    def warnings(self) -> list[str]:
+        notes = []
+        bindings = {c: binding_of(self.cfg, c) for c, _ in CONTROLS}
+        if "special:mode_hold" not in bindings.values():
+            notes.append("nothing toggles desktop/game mode — you'll need the CLI to get back")
+        if "btn:BTN_LEFT" not in bindings.values():
+            notes.append("nothing left-clicks")
+        return notes
+
+    def save(self) -> None:
+        try:
+            text = open(self.path).read()
+            for control, _ in CONTROLS:
+                section, key = section_of(control)
+                text = set_in_toml(text, section, key, self.cfg[section][key])
+            for entry in FEEL:
+                text = set_in_toml(text, entry[0], entry[1], self.cfg[entry[0]][entry[1]])
+            shutil.copy(self.path, f"{self.path}.bak.{int(time.time())}")
+            with open(self.path, "w") as handle:
+                handle.write(text)
+        except OSError as exc:
+            self.message = f"could not save: {exc}"
+            return
+        daemon("reload")
+        self.saved = copy.deepcopy(self.cfg)
+        self.dirty = False
+        notes = self.warnings()
+        self.message = "saved" + (" — warning: " + "; ".join(notes) if notes else "")
+
+    def revert(self) -> None:
+        self.cfg = copy.deepcopy(self.saved)
+        daemon("reload")          # drops the live-preview values too
+        self.dirty = False
+        self.message = "reverted to the saved config"
+
+    def adjust(self, entry, direction: int) -> None:
+        section, key, _label, low, high, step, unit = entry
+        value = self.cfg[section][key]
+        if unit == "bool":
+            self.push(section, key, not value)
+            return
+        reference = LN.DEFAULT_CONFIG[section][key]
+        new = max(low, min(high, float(value) + direction * step))
+        self.push(section, key, int(round(new)) if isinstance(reference, int) else round(new, 4))
+
+    # -- loop --------------------------------------------------------------
+
+    def run(self) -> int:
+        try:
+            curses.set_escdelay(25)
+        except (AttributeError, curses.error):
+            pass
+        self.screen.keypad(True)
+        curses.curs_set(0)
+        self.screen.timeout(1000)
+        quitting = False
+        last_refresh = 0.0
+
+        while True:
+            self.draw()
+            key = self.screen.getch()
+
+            now = time.monotonic()
+            if self.live and now - last_refresh > 2.0:
+                daemon("inhibit refresh")
+                last_refresh = now
+            if key == -1:
+                continue
+
+            if key != ord("q"):
+                quitting = False
+            items = self.items()
+            row = self.rows[self.tab]
+
+            if key in (ord("s"),):
+                self.save()
+            elif key in (ord("r"),):
+                self.revert()
+            elif key == 27:
+                self.focus = {"actions": "list", "list": "tabs"}.get(self.focus, "tabs")
+                self.message = ""
+            elif key == ord("q"):
+                if self.dirty and not quitting:
+                    quitting = True
+                    self.message = "unsaved changes — press again to discard, or Save"
+                else:
+                    if self.dirty:
+                        daemon("reload")
+                    return 0
+            elif self.focus == "tabs":
+                if key == curses.KEY_LEFT:
+                    self.tab = (self.tab - 1) % len(TABS)
+                elif key == curses.KEY_RIGHT:
+                    self.tab = (self.tab + 1) % len(TABS)
+                elif key == curses.KEY_DOWN:
+                    self.focus = "list"
+            elif self.focus == "list":
+                if key == curses.KEY_UP:
+                    if row == 0:
+                        self.focus = "tabs"
+                    else:
+                        self.rows[self.tab] = row - 1
+                elif key == curses.KEY_DOWN:
+                    if row >= len(items) - 1:
+                        self.focus = "actions"
+                    else:
+                        self.rows[self.tab] = row + 1
+                elif key in (curses.KEY_LEFT, curses.KEY_RIGHT):
+                    step = -1 if key == curses.KEY_LEFT else 1
+                    if self.tab == 1:
+                        self.adjust(items[row], step)
+                    else:
+                        self.tab = (self.tab + step) % len(TABS)
+                elif key in (10, 13, curses.KEY_ENTER):
+                    if self.tab == 0:
+                        control = items[row][0]
+                        spec = self.pick_action(control)
+                        if spec is not None:
+                            section, name = section_of(control)
+                            self.push(section, name, spec)
+                    elif items[row][6] == "bool":
+                        self.adjust(items[row], 1)
+            elif self.focus == "actions":
+                if key == curses.KEY_LEFT:
+                    self.action = (self.action - 1) % len(ACTIONS)
+                elif key == curses.KEY_RIGHT:
+                    self.action = (self.action + 1) % len(ACTIONS)
+                elif key == curses.KEY_UP:
+                    self.focus = "list"
+                elif key in (10, 13, curses.KEY_ENTER):
+                    choice = ACTIONS[self.action]
+                    if choice == "Save":
+                        self.save()
+                    elif choice == "Revert":
+                        self.revert()
+                    else:
+                        if self.dirty and not quitting:
+                            quitting = True
+                            self.message = "unsaved changes — press again to discard"
+                        else:
+                            if self.dirty:
+                                daemon("reload")
+                            return 0
+
+
+# --------------------------------------------------------------------------- entry point
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="legion-config", description=__doc__.splitlines()[0])
+    parser.add_argument("--print", dest="plain", action="store_true",
+                        help="print the diagram and mapping, then exit")
+    parser.add_argument("-c", "--config", help="config file to edit")
+    args = parser.parse_args(argv)
+
+    path = args.config or ensure_user_config()
+    cfg = LN.load_config(path)
+
+    if args.plain:
+        print_mapping(cfg)
+        return 0
+
+    if not sys.stdout.isatty():
+        print("legion-config: not a terminal; use --print", file=sys.stderr)
+        return 1
+
+    import locale
+    locale.setlocale(locale.LC_ALL, "")
+
+    def bootstrap(screen):
+        curses.use_default_colors()
+        colors = theme_colors()
+        accent = colors["accent"] if colors["accent"] is not None else curses.COLOR_CYAN
+        fg = colors["fg"] if colors["fg"] is not None else -1
+        muted = colors["muted"] if colors["muted"] is not None else curses.COLOR_BLUE
+        curses.init_pair(1, accent, -1)      # focus / highlight
+        curses.init_pair(2, curses.COLOR_YELLOW, -1)
+        curses.init_pair(3, fg, -1)          # normal text
+        curses.init_pair(4, muted, -1)       # help text
+        return App(screen, cfg, path).run()
+
+    daemon("inhibit on")
+    try:
+        return curses.wrapper(bootstrap)
+    finally:
+        # Always hand the pad back, even if the UI died mid-edit.
+        daemon("inhibit off")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

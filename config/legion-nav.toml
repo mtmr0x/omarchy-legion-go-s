@@ -1,0 +1,147 @@
+# legion-nav configuration for the Lenovo Legion Go S.
+#
+# Installed to ~/.config/legion-nav/config.toml. Edit that copy -- the daemon
+# prefers it and falls back to this one in the repo.
+#
+# Apply changes with:  systemctl --user restart legion-nav
+
+# --------------------------------------------------------------------- actions
+#
+#   key:KEY_ENTER    hold a keyboard key for as long as the control is held
+#   btn:BTN_LEFT     hold a mouse button
+#   exec:some cmd    run a shell command once, on press
+#   special:...      precision | mode_hold
+#   none             do nothing
+#
+# Any KEY_* / BTN_* name from `python3 -c "from evdev import ecodes; print(ecodes.keys)"`
+# works. Run `legion-nav probe` to confirm which physical button is which.
+
+[buttons]
+# Face buttons.
+a      = "btn:BTN_LEFT"
+b      = "btn:BTN_RIGHT"
+x      = "exec:legion-osk toggle"
+y      = "key:KEY_ENTER"
+
+# Shoulders and triggers.
+lb     = "exec:hyprctl dispatch workspace e-1"
+rb     = "exec:hyprctl dispatch workspace e+1"
+lt     = "key:KEY_ESC"
+rt     = "exec:omarchy menu toggle window"
+
+# Stick clicks.
+l3     = "btn:BTN_MIDDLE"
+r3     = "special:precision"
+
+# System buttons.
+start  = "exec:omarchy-menu"
+select = "key:KEY_LEFTMETA"
+legion = "special:mode_hold"
+
+[dpad_keys]
+up    = "key:KEY_UP"
+down  = "key:KEY_DOWN"
+left  = "key:KEY_LEFT"
+right = "key:KEY_RIGHT"
+
+# --------------------------------------------------------------------- feel
+
+[cursor]
+# Pixels per second at full stick deflection. The panel runs at scale 2, so the
+# logical desktop is 960 px wide -- 1500 crosses it in about two thirds of a
+# second. Raise it if the cursor feels sluggish.
+max_speed = 1500.0
+
+# Fraction of stick travel ignored around centre. The hardware only reports a
+# 0.4% flat zone, which is far too tight for thumb rest.
+deadzone = 0.12
+
+# Response curve. 1.0 is linear; higher means finer control near centre and the
+# the same top speed at full deflection.
+expo = 2.0
+
+# Cursor speed multiplier while R3 (special:precision) is held.
+precision_factor = 0.3
+
+# Polling rate of the motion loop.
+tick_hz = 200
+
+[scroll]
+# Right-stick scrolling is OFF.
+#
+# A thumbstick has mass, so picking the machine up off a table -- or just
+# gripping it firmly -- throws the stick well past any sane deadzone for a
+# moment. The page then scrolls on its own, which feels exactly like a motion
+# sensor doing it. Measured peaks while lifting the device were near FULL
+# deflection, so no deadzone alone is enough.
+#
+# To get scrolling back, set enabled = true. The safeguards below then apply:
+# a much larger deadzone, plus a delay that the stick must be held past that
+# deadzone before scrolling starts. A knock is over in tens of milliseconds; a
+# real scroll is held, so the delay separates them cleanly.
+enabled = false
+
+# Scroll notches per second at full deflection of the right stick.
+max_speed = 18.0
+
+# Fraction of stick travel ignored. Much larger than the cursor's, because an
+# accidental nudge here is far more disruptive than a little cursor drift.
+deadzone = 0.35
+
+expo = 2.0
+
+# Hold the stick past the deadzone for this long before scrolling begins.
+# Set to 0 for the old instant behaviour.
+engage_ms = 150
+
+# true reverses the direction (content follows the stick).
+natural = false
+
+[triggers]
+# The triggers are analog only (0-255, no digital press), so they need a
+# threshold. Separate press/release points stop them chattering at the edge.
+press_at   = 0.5
+release_at = 0.35
+
+# --------------------------------------------------------------------- modes
+
+[modes]
+# Automatically drop to game mode when a game takes focus.
+auto = true
+
+# Treat a truly fullscreen window as a game.
+fullscreen_is_game = true
+
+# Trust the Wayland content-type hint when a client sets contentType = "game".
+content_type_is_game = true
+
+# How long to hold the Legion button to force a mode switch.
+mode_hold_seconds = 0.6
+
+# Window classes that always mean game mode. Case-insensitive, glob patterns.
+game_classes = [
+  "steam",
+  "steam_app_*",
+  "steam_proton",
+  "gamescope",
+  "lutris",
+  "heroic",
+  "bottles",
+  "retroarch",
+  "ppsspp*",
+  "dolphin-emu",
+  "rpcs3",
+  "cemu",
+  "org.prismlauncher.*",
+]
+
+# Classes that stay in desktop mode even when fullscreen. Anything here is
+# exempt from the fullscreen-means-game rule above.
+#
+# The screensaver matters: it is a fullscreen window, so without this the pad
+# would drop to game mode exactly when you need it to dismiss the screensaver.
+desktop_classes = [
+  "org.omarchy.screensaver",
+  "org.omarchy.*",
+  "hyprlock",
+]

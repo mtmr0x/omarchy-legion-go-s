@@ -1,0 +1,1045 @@
+#!/usr/bin/env python3
+"""legion-nav - drive the Omarchy desktop with the Legion Go S gamepad.
+
+Reads the built-in controller (1a86:e310, driven by hid_lenovo_go_s), and
+translates it into a virtual mouse + keyboard via uinput.
+
+In desktop mode the pad is grabbed exclusively (EVIOCGRAB), so nothing leaks
+through to games or joydev. In game mode the grab is released and the pad
+behaves normally -- but we keep reading it non-exclusively so the on-device
+override chord still works.
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fnmatch
+import json
+import math
+import os
+import selectors
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - python < 3.11
+    import tomli as tomllib  # type: ignore
+
+try:
+    import evdev
+    from evdev import ecodes as e
+except ModuleNotFoundError:
+    sys.exit("legion-nav: python-evdev is not installed (pacman -S python-evdev)")
+
+VENDOR = 0x1A86
+PRODUCTS = (0xE310, 0xE311)
+
+# Physical labels -> evdev codes.
+#
+# Codes 307 and 308 have two sets of names that mean opposite things:
+# Documentation/input/gamepad.rst names the face buttons by compass point
+# (BTN_NORTH=307, BTN_WEST=308, so 307 would be Y on an Xbox-style pad), while
+# the legacy joystick names (BTN_X=307, BTN_Y=308) put them the other way round.
+#
+# Verified on real hardware: hid-lenovo-go-s follows the LEGACY naming, so 307
+# is the button printed X and 308 is the one printed Y. The aliases below are
+# chosen to match what is actually on the plastic. Re-check with
+# `legion-nav probe` if you are on different firmware.
+BUTTONS = {
+    "a": e.BTN_A,
+    "b": e.BTN_B,
+    "x": e.BTN_X,
+    "y": e.BTN_Y,
+    "lb": e.BTN_TL,
+    "rb": e.BTN_TR,
+    "select": e.BTN_SELECT,
+    "start": e.BTN_START,
+    "legion": e.BTN_MODE,
+    "l3": e.BTN_THUMBL,
+    "r3": e.BTN_THUMBR,
+}
+CODE_TO_BUTTON = {code: name for name, code in BUTTONS.items()}
+
+DPAD = ("dpad_up", "dpad_down", "dpad_left", "dpad_right")
+TRIGGERS = ("lt", "rt")
+
+# Actions offered by `legion-config`, and the source of the uinput key superset.
+#
+# Declaring every one of these on the virtual keyboard up front means a binding
+# can be changed at runtime without tearing down and recreating the device,
+# which would make Hyprland re-detect it mid-edit.
+ACTION_CATALOG = [
+    ("Left click", "btn:BTN_LEFT"),
+    ("Right click", "btn:BTN_RIGHT"),
+    ("Middle click", "btn:BTN_MIDDLE"),
+    ("Enter", "key:KEY_ENTER"),
+    ("Escape", "key:KEY_ESC"),
+    ("Tab", "key:KEY_TAB"),
+    ("Backspace", "key:KEY_BACKSPACE"),
+    ("Space", "key:KEY_SPACE"),
+    ("Arrow up", "key:KEY_UP"),
+    ("Arrow down", "key:KEY_DOWN"),
+    ("Arrow left", "key:KEY_LEFT"),
+    ("Arrow right", "key:KEY_RIGHT"),
+    ("Page up", "key:KEY_PAGEUP"),
+    ("Page down", "key:KEY_PAGEDOWN"),
+    ("Home", "key:KEY_HOME"),
+    ("End", "key:KEY_END"),
+    ("Delete", "key:KEY_DELETE"),
+    ("Super (overview)", "key:KEY_LEFTMETA"),
+    ("Alt", "key:KEY_LEFTALT"),
+    ("Ctrl", "key:KEY_LEFTCTRL"),
+    ("Shift", "key:KEY_LEFTSHIFT"),
+    ("On-screen keyboard", "exec:legion-osk toggle"),
+    ("Window menu", "exec:omarchy menu toggle window"),
+    ("Omarchy menu", "exec:omarchy-menu"),
+    ("Workspace previous", "exec:hyprctl dispatch workspace e-1"),
+    ("Workspace next", "exec:hyprctl dispatch workspace e+1"),
+    ("Close window", "exec:hyprctl dispatch killactive"),
+    ("Fullscreen", "exec:hyprctl dispatch fullscreen 0"),
+    ("Float / tile", "exec:hyprctl dispatch togglefloating"),
+    ("Lock screen", "exec:omarchy-system-lock"),
+    ("Precision (hold)", "special:precision"),
+    ("Desktop/game toggle (hold)", "special:mode_hold"),
+    ("Nothing", "none"),
+]
+
+# While the configurator is open, only these controls reach the desktop.
+# Everything else would fight the UI you are editing -- the bumpers would
+# change workspace out from under it, RT would open a menu over it.
+INHIBIT_ALLOWED = {"dpad_up", "dpad_down", "dpad_left", "dpad_right", "a", "y", "lt"}
+
+DEFAULT_CONFIG = {
+    "cursor": {
+        "max_speed": 1500.0,
+        "deadzone": 0.12,
+        "expo": 2.0,
+        "precision_factor": 0.3,
+        "tick_hz": 200,
+    },
+    "scroll": {
+        "enabled": False,
+        "max_speed": 18.0,
+        "deadzone": 0.35,
+        "expo": 2.0,
+        "engage_ms": 150,
+        "natural": False,
+    },
+    "triggers": {"press_at": 0.5, "release_at": 0.35},
+    "modes": {
+        "auto": True,
+        "fullscreen_is_game": True,
+        "content_type_is_game": True,
+        "mode_hold_seconds": 0.6,
+        "game_classes": [],
+        "desktop_classes": [],
+    },
+    "buttons": {},
+    "dpad_keys": {},
+}
+
+
+# --------------------------------------------------------------------------- config
+
+
+def config_paths(explicit: str | None) -> list[str]:
+    if explicit:
+        return [explicit]
+    here = os.path.dirname(os.path.realpath(__file__))
+    return [
+        os.path.expanduser("~/.config/legion-nav/config.toml"),
+        os.path.join(os.path.dirname(here), "config", "legion-nav.toml"),
+    ]
+
+
+def deep_merge(base: dict, over: dict) -> dict:
+    out = dict(base)
+    for key, value in over.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def load_config(explicit: str | None) -> dict:
+    for path in config_paths(explicit):
+        if os.path.exists(path):
+            with open(path, "rb") as handle:
+                return deep_merge(DEFAULT_CONFIG, tomllib.load(handle))
+    return dict(DEFAULT_CONFIG)
+
+
+def coerce_setting(section: str, key: str, raw: str):
+    """Turn a control-socket string into the type DEFAULT_CONFIG uses."""
+    ref = DEFAULT_CONFIG.get(section, {}).get(key)
+    if isinstance(ref, bool):
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
+    if isinstance(ref, int):
+        return int(float(raw))
+    if isinstance(ref, float):
+        return float(raw)
+    return raw
+
+
+# --------------------------------------------------------------------------- actions
+
+
+class Action:
+    """A parsed action spec: 'key:KEY_ENTER', 'btn:BTN_LEFT', 'exec:cmd', 'special:x'."""
+
+    __slots__ = ("kind", "value", "code")
+
+    def __init__(self, spec: str):
+        spec = (spec or "").strip()
+        if not spec or spec in ("none", "special:none"):
+            self.kind, self.value, self.code = "none", "", None
+            return
+        kind, _, value = spec.partition(":")
+        self.kind, self.value, self.code = kind.strip(), value.strip(), None
+        if self.kind in ("key", "btn"):
+            code = e.ecodes.get(self.value)
+            if code is None:
+                raise ValueError(f"unknown evdev code {self.value!r}")
+            self.code = code
+        elif self.kind not in ("exec", "special"):
+            raise ValueError(f"unknown action kind {self.kind!r} in {spec!r}")
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"Action({self.kind}:{self.value})"
+
+
+def build_actions(cfg: dict) -> dict[str, Action]:
+    actions: dict[str, Action] = {}
+    for name, spec in (cfg.get("buttons") or {}).items():
+        actions[name] = Action(spec)
+    for name, spec in (cfg.get("dpad_keys") or {}).items():
+        key = name if name.startswith("dpad_") else f"dpad_{name}"
+        actions[key] = Action(spec)
+    return actions
+
+
+# --------------------------------------------------------------------------- uinput
+
+
+class Virtual:
+    """A virtual pointer and a virtual keyboard, kept as separate uinput devices.
+
+    libinput classifies a device by its capabilities; mixing REL axes and a full
+    keymap into one node makes it guess badly, so they stay split (this is what
+    keyd does too).
+    """
+
+    def __init__(self, actions: dict[str, Action]):
+        keys = {e.KEY_LEFTMETA, e.KEY_LEFTCTRL, e.KEY_LEFTALT, e.KEY_LEFTSHIFT}
+        btns = {e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE}
+        for _label, spec in ACTION_CATALOG:
+            kind, _, value = spec.partition(":")
+            code = e.ecodes.get(value)
+            if code is None:
+                continue
+            (keys if kind == "key" else btns).add(code)
+        for action in actions.values():
+            if action.kind == "key":
+                keys.add(action.code)
+            elif action.kind == "btn":
+                btns.add(action.code)
+
+        try:
+            self.pointer = evdev.UInput(
+                {
+                    e.EV_KEY: sorted(btns),
+                    e.EV_REL: [
+                        e.REL_X,
+                        e.REL_Y,
+                        e.REL_WHEEL,
+                        e.REL_HWHEEL,
+                        e.REL_WHEEL_HI_RES,
+                        e.REL_HWHEEL_HI_RES,
+                    ],
+                },
+                name="legion-nav pointer",
+                vendor=0x1A86,
+                product=0x9001,
+            )
+            self.keyboard = evdev.UInput(
+                {e.EV_KEY: sorted(keys)},
+                name="legion-nav keyboard",
+                vendor=0x1A86,
+                product=0x9002,
+            )
+        except (PermissionError, OSError, evdev.uinput.UInputError) as exc:
+            sys.exit(
+                f"legion-nav: cannot create virtual input devices ({exc}).\n"
+                "  Install the udev rule and reload it:\n"
+                "    sudo install -m644 udev/99-uinput.rules /etc/udev/rules.d/\n"
+                "    sudo udevadm control --reload && sudo udevadm trigger\n"
+                "  You also need to be in the 'input' group: id -nG | grep input"
+            )
+
+        self.declared = {"key": frozenset(keys), "btn": frozenset(btns)}
+        self.held: set[tuple[str, int]] = set()
+        self._hires = {"v": 0.0, "h": 0.0}
+        self._notch = {"v": 0.0, "h": 0.0}
+
+    def _dev(self, kind: str) -> evdev.UInput:
+        return self.pointer if kind == "btn" else self.keyboard
+
+    def set_key(self, kind: str, code: int, down: bool) -> None:
+        entry = (kind, code)
+        if down and entry in self.held:
+            return
+        if not down and entry not in self.held:
+            return
+        dev = self._dev(kind)
+        dev.write(e.EV_KEY, code, 1 if down else 0)
+        dev.syn()
+        self.held.add(entry) if down else self.held.discard(entry)
+
+    def tap(self, kind: str, code: int) -> None:
+        dev = self._dev(kind)
+        dev.write(e.EV_KEY, code, 1)
+        dev.syn()
+        dev.write(e.EV_KEY, code, 0)
+        dev.syn()
+
+    def move(self, dx: int, dy: int) -> None:
+        if not dx and not dy:
+            return
+        if dx:
+            self.pointer.write(e.EV_REL, e.REL_X, dx)
+        if dy:
+            self.pointer.write(e.EV_REL, e.REL_Y, dy)
+        self.pointer.syn()
+
+    def scroll(self, dy: float, dx: float) -> None:
+        """Emit smooth hi-res scroll, plus a legacy notch every 120 hi-res units.
+
+        Both have to be sent: hi-res is what modern Wayland clients use, legacy
+        REL_WHEEL is the fallback for everything else. They are accumulated
+        separately so rounding on one never desyncs the other.
+        """
+        self._hires["v"] += dy * 120.0
+        self._hires["h"] += dx * 120.0
+        wrote = False
+        for axis, hi_code, lo_code in (
+            ("v", e.REL_WHEEL_HI_RES, e.REL_WHEEL),
+            ("h", e.REL_HWHEEL_HI_RES, e.REL_HWHEEL),
+        ):
+            step = int(self._hires[axis])
+            if not step:
+                continue
+            self._hires[axis] -= step
+            self.pointer.write(e.EV_REL, hi_code, step)
+            wrote = True
+
+            self._notch[axis] += step
+            notches = int(self._notch[axis] / 120.0)
+            if notches:
+                self._notch[axis] -= notches * 120.0
+                self.pointer.write(e.EV_REL, lo_code, notches)
+        if wrote:
+            self.pointer.syn()
+
+    def release_all(self) -> None:
+        for kind, code in list(self.held):
+            self._dev(kind).write(e.EV_KEY, code, 0)
+        self.pointer.syn()
+        self.keyboard.syn()
+        self.held.clear()
+        self._hires = {"v": 0.0, "h": 0.0}
+        self._notch = {"v": 0.0, "h": 0.0}
+
+    def close(self) -> None:
+        self.release_all()
+        self.pointer.close()
+        self.keyboard.close()
+
+
+# --------------------------------------------------------------------------- hyprland
+
+
+class Hypr:
+    """Minimal Hyprland IPC: a socket2 event stream plus socket1 queries."""
+
+    def __init__(self):
+        self.dir = self._find_dir()
+        self.events: socket.socket | None = None
+        self._buf = b""
+
+    @staticmethod
+    def _find_dir() -> str | None:
+        runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+        root = os.path.join(runtime, "hypr")
+        sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+        if sig and os.path.isdir(os.path.join(root, sig)):
+            return os.path.join(root, sig)
+        if not os.path.isdir(root):
+            return None
+        # No inherited signature (e.g. started before the compositor): take the
+        # most recently created instance directory.
+        candidates = [os.path.join(root, name) for name in os.listdir(root)]
+        candidates = [path for path in candidates if os.path.exists(os.path.join(path, ".socket.sock"))]
+        if not candidates:
+            return None
+        return max(candidates, key=os.path.getmtime)
+
+    def connect(self) -> socket.socket | None:
+        self.dir = self.dir or self._find_dir()
+        if not self.dir:
+            return None
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.connect(os.path.join(self.dir, ".socket2.sock"))
+            sock.setblocking(False)
+            self.events = sock
+            self._buf = b""
+            return sock
+        except OSError:
+            self.events = None
+            return None
+
+    def read_events(self) -> list[str]:
+        if not self.events:
+            return []
+        try:
+            chunk = self.events.recv(8192)
+        except BlockingIOError:
+            return []
+        except OSError:
+            chunk = b""
+        if not chunk:
+            self.events.close()
+            self.events = None
+            return []
+        self._buf += chunk
+        *lines, self._buf = self._buf.split(b"\n")
+        return [line.decode("utf-8", "replace") for line in lines]
+
+    def active_window(self) -> dict:
+        if not self.dir:
+            return {}
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(0.5)
+                sock.connect(os.path.join(self.dir, ".socket.sock"))
+                sock.sendall(b"j/activewindow")
+                data = b""
+                while True:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+            return json.loads(data or b"{}")
+        except (OSError, ValueError):
+            return {}
+
+
+# --------------------------------------------------------------------------- control socket
+
+
+def control_path() -> str:
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    return os.path.join(runtime, "legion-nav.sock")
+
+
+def send_command(command: str) -> str:
+    path = control_path()
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(1.0)
+            sock.connect(path)
+            sock.sendall(command.encode() + b"\n")
+            return sock.recv(4096).decode().strip()
+    except (OSError, socket.timeout) as exc:
+        raise SystemExit(f"legion-nav: daemon not reachable at {path} ({exc})")
+
+
+# --------------------------------------------------------------------------- helpers
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return low if value < low else high if value > high else value
+
+
+def curve(value: float, deadzone: float, expo: float) -> float:
+    """Deadzone + exponential response, normalised so full deflection is 1.0."""
+    magnitude = abs(value)
+    if magnitude <= deadzone:
+        return 0.0
+    scaled = (magnitude - deadzone) / (1.0 - deadzone)
+    return math.copysign(clamp(scaled, 0.0, 1.0) ** expo, value)
+
+
+def find_device() -> evdev.InputDevice | None:
+    for path in evdev.list_devices():
+        try:
+            dev = evdev.InputDevice(path)
+        except OSError:
+            continue
+        if dev.info.vendor == VENDOR and dev.info.product in PRODUCTS:
+            return dev
+        dev.close()
+    return None
+
+
+# --------------------------------------------------------------------------- daemon
+
+
+class Nav:
+    def __init__(self, cfg: dict, verbose: bool = False, config_path: str | None = None):
+        self.cfg = cfg
+        self.config_path = config_path
+        self.verbose = verbose
+        self.actions = build_actions(cfg)
+        self.virtual = Virtual(self.actions)
+        self.hypr = Hypr()
+
+        self.dev: evdev.InputDevice | None = None
+        self.grabbed = False
+        self.mode = "game"
+        self.override: str | None = None
+        self.override_class: str | None = None
+        self.auto_mode = "desktop"
+
+        self.axes = {e.ABS_X: 0, e.ABS_Y: 0, e.ABS_RX: 0, e.ABS_RY: 0,
+                     e.ABS_Z: 0, e.ABS_RZ: 0, e.ABS_HAT0X: 0, e.ABS_HAT0Y: 0}
+        self.down: set[str] = set()
+        self.precision = False
+        self.legion_since: float | None = None
+        self.scroll_since: float | None = None
+        # Inhibit expires on its own, so a configurator that crashes cannot
+        # leave the pad crippled.
+        self.inhibit_until = 0.0
+        self.cursor_frac = [0.0, 0.0]
+        self.running = True
+
+        self.control = self._listen()
+
+    # -- logging -----------------------------------------------------------
+
+    def log(self, message: str) -> None:
+        print(f"legion-nav: {message}", flush=True)
+
+    def debug(self, message: str) -> None:
+        if self.verbose:
+            self.log(message)
+
+    # -- control socket ----------------------------------------------------
+
+    def _listen(self) -> socket.socket:
+        path = control_path()
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind(path)
+        os.chmod(path, 0o600)
+        sock.listen(4)
+        sock.setblocking(False)
+        return sock
+
+    def handle_control(self) -> None:
+        try:
+            conn, _ = self.control.accept()
+        except BlockingIOError:
+            return
+        with conn:
+            conn.settimeout(0.5)
+            try:
+                command = conn.recv(256).decode().strip()
+            except (OSError, socket.timeout):
+                return
+            reply = self.run_command(command)
+            try:
+                conn.sendall(reply.encode() + b"\n")
+            except OSError:
+                pass
+
+    def apply_config(self, cfg: dict) -> None:
+        """Swap in a new config, rebuilding anything derived from it.
+
+        tick() reads self.cfg every pass, so the feel settings are live the
+        moment this returns. Bindings are not -- they are compiled into
+        self.actions -- so those are rebuilt here.
+        """
+        actions = build_actions(cfg)          # raises on a bad spec; caller reports
+        self.cfg = cfg
+        self.actions = actions
+
+        # Virtual devices declare their key capabilities once, at creation. The
+        # catalogue superset covers every offered action, so this is only hit by
+        # a hand-written custom binding.
+        undeclared = [
+            a for a in actions.values()
+            if a.kind in ("key", "btn") and a.code not in self.virtual.declared[a.kind]
+        ]
+        if undeclared:
+            self.log("binding uses an undeclared code; recreating virtual devices")
+            self.virtual.close()
+            self.virtual = Virtual(actions)
+        self.down.clear()
+
+    def run_command(self, command: str) -> str:
+        if command == "status":
+            return json.dumps({
+                "mode": self.mode,
+                "auto": self.auto_mode,
+                "override": self.override,
+                "device": self.dev.path if self.dev else None,
+                "grabbed": self.grabbed,
+                "inhibited": self.inhibited(),
+            })
+
+        if command == "config":
+            return json.dumps(self.cfg)
+
+        if command == "reload":
+            try:
+                self.apply_config(load_config(self.config_path))
+            except (OSError, ValueError) as exc:
+                return f"error: {exc}"
+            self.log("config reloaded")
+            return "reloaded"
+
+        if command.startswith("set "):
+            try:
+                target, _, raw = command[4:].strip().partition(" ")
+                section, _, key = target.partition(".")
+                if not section or not key:
+                    raise ValueError("expected 'set section.key value'")
+                cfg = deep_merge(self.cfg, {section: {key: coerce_setting(section, key, raw)}})
+                self.apply_config(cfg)
+            except (ValueError, KeyError) as exc:
+                return f"error: {exc}"
+            return "ok"
+
+        if command.startswith("inhibit"):
+            arg = command[len("inhibit"):].strip() or "on"
+            if arg in ("on", "refresh"):
+                # Lease-based: the configurator re-arms it while it runs, so a
+                # crashed one expires instead of leaving the pad half-dead.
+                self.inhibit_until = time.monotonic() + 5.0
+            elif arg == "off":
+                self.inhibit_until = 0.0
+                self.virtual.release_all()
+            else:
+                return f"error: inhibit takes on|off|refresh, got {arg!r}"
+            return "ok"
+
+        if command == "toggle":
+            self.set_override("game" if self.mode == "desktop" else "desktop")
+        elif command == "on":
+            self.set_override("desktop")
+        elif command == "off":
+            self.set_override("game")
+        elif command == "auto":
+            self.override = self.override_class = None
+        else:
+            return f"error: unknown command {command!r}"
+        self.apply_mode()
+        return self.mode
+
+    def set_override(self, mode: str) -> None:
+        self.override = mode
+        window = self.hypr.active_window()
+        self.override_class = (window.get("class") or "").lower() or None
+        self.log(f"override -> {mode} (until focus leaves {self.override_class or 'current window'})")
+
+    # -- mode --------------------------------------------------------------
+
+    def target_mode(self) -> str:
+        if self.override:
+            return self.override
+        if not self.cfg["modes"].get("auto", True):
+            return "desktop"
+        return self.auto_mode
+
+    def apply_mode(self) -> None:
+        target = self.target_mode()
+        if target == self.mode:
+            return
+        self.mode = target
+        self.virtual.release_all()
+        self.down.clear()
+        self.precision = False
+        self.cursor_frac = [0.0, 0.0]
+        self.set_grab(target == "desktop")
+        self.log(f"mode -> {target}")
+
+    def set_grab(self, want: bool) -> None:
+        if not self.dev or want == self.grabbed:
+            return
+        try:
+            self.dev.grab() if want else self.dev.ungrab()
+            self.grabbed = want
+        except OSError as exc:
+            self.log(f"could not {'grab' if want else 'ungrab'} the pad: {exc}")
+
+    def evaluate_window(self) -> None:
+        window = self.hypr.active_window()
+        klass = (window.get("class") or "").lower()
+        modes = self.cfg["modes"]
+
+        if self.override and klass and self.override_class and klass != self.override_class:
+            self.log("override cleared (focus changed)")
+            self.override = self.override_class = None
+
+        def matches(patterns) -> bool:
+            return any(fnmatch.fnmatch(klass, str(p).lower()) for p in patterns)
+
+        game = False
+        if klass:
+            if matches(modes.get("game_classes") or []):
+                game = True
+            elif modes.get("content_type_is_game", True) and window.get("contentType") == "game":
+                game = True
+            elif modes.get("fullscreen_is_game", True) and int(window.get("fullscreen") or 0) >= 2:
+                game = not matches(modes.get("desktop_classes") or [])
+
+        new_mode = "game" if game else "desktop"
+        if new_mode != self.auto_mode:
+            self.debug(f"auto -> {new_mode} (class={klass or 'none'})")
+            self.auto_mode = new_mode
+        self.apply_mode()
+
+    # -- input -------------------------------------------------------------
+
+    def norm(self, code: int) -> float:
+        # Signed 16-bit axes are asymmetric: +32767 but -32768. Dividing both
+        # by 32768 means a full push right never quite reaches 1.0.
+        value = self.axes[code]
+        return clamp(value / (32767.0 if value > 0 else 32768.0), -1.0, 1.0)
+
+    def trigger(self, code: int) -> float:
+        return clamp(self.axes[code] / 255.0, 0.0, 1.0)
+
+    def handle_event(self, event) -> None:
+        if event.type == e.EV_KEY:
+            name = CODE_TO_BUTTON.get(event.code)
+            if name and event.value in (0, 1):
+                self.on_control(name, bool(event.value))
+            return
+        if event.type != e.EV_ABS or event.code not in self.axes:
+            return
+
+        self.axes[event.code] = event.value
+
+        if event.code == e.ABS_HAT0X:
+            self.edge("dpad_left", event.value < 0)
+            self.edge("dpad_right", event.value > 0)
+        elif event.code == e.ABS_HAT0Y:
+            self.edge("dpad_up", event.value < 0)
+            self.edge("dpad_down", event.value > 0)
+        elif event.code in (e.ABS_Z, e.ABS_RZ):
+            name = "lt" if event.code == e.ABS_Z else "rt"
+            cfg = self.cfg["triggers"]
+            value = event.value / 255.0
+            if value >= cfg["press_at"]:
+                self.edge(name, True)
+            elif value <= cfg["release_at"]:
+                self.edge(name, False)
+
+    def edge(self, name: str, down: bool) -> None:
+        if down == (name in self.down):
+            return
+        self.on_control(name, down)
+
+    def inhibited(self) -> bool:
+        return time.monotonic() < self.inhibit_until
+
+    def on_control(self, name: str, down: bool) -> None:
+        self.down.add(name) if down else self.down.discard(name)
+        action = self.actions.get(name)
+        if action is None or action.kind == "none":
+            return
+
+        # While a configurator is up, only navigation reaches the desktop.
+        if self.inhibited() and name not in INHIBIT_ALLOWED:
+            return
+
+        # The mode-hold chord is the one thing that still works in game mode --
+        # it is how you get back out when auto-detection guesses wrong.
+        if action.kind == "special" and action.value == "mode_hold":
+            self.legion_since = time.monotonic() if down else None
+            return
+
+        if self.mode != "desktop":
+            return
+
+        if action.kind == "key":
+            self.virtual.set_key("key", action.code, down)
+        elif action.kind == "btn":
+            self.virtual.set_key("btn", action.code, down)
+        elif action.kind == "special" and action.value == "precision":
+            self.precision = down
+        elif action.kind == "exec" and down:
+            self.spawn(action.value)
+
+    def spawn(self, command: str) -> None:
+        try:
+            subprocess.Popen(
+                command, shell=True, start_new_session=True,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            self.log(f"failed to run {command!r}: {exc}")
+
+    # -- tick --------------------------------------------------------------
+
+    def tick(self, dt: float) -> None:
+        if self.inhibited():
+            self.legion_since = None
+        if self.legion_since is not None:
+            held = time.monotonic() - self.legion_since
+            if held >= self.cfg["modes"].get("mode_hold_seconds", 0.6):
+                self.legion_since = None
+                self.run_command("toggle")
+
+        if self.mode != "desktop":
+            return
+
+        cursor = self.cfg["cursor"]
+        speed = cursor["max_speed"] * (cursor["precision_factor"] if self.precision else 1.0)
+        for index, axis in enumerate((e.ABS_X, e.ABS_Y)):
+            velocity = curve(self.norm(axis), cursor["deadzone"], cursor["expo"]) * speed
+            self.cursor_frac[index] += velocity * dt
+        dx = int(self.cursor_frac[0])
+        dy = int(self.cursor_frac[1])
+        self.cursor_frac[0] -= dx
+        self.cursor_frac[1] -= dy
+        self.virtual.move(dx, dy)
+
+        scroll = self.cfg["scroll"]
+        if not scroll.get("enabled", True):
+            self.scroll_since = None
+            return
+
+        vertical = curve(self.norm(e.ABS_RY), scroll["deadzone"], scroll["expo"])
+        horizontal = curve(self.norm(e.ABS_RX), scroll["deadzone"], scroll["expo"])
+        if not vertical and not horizontal:
+            self.scroll_since = None
+            return
+
+        # A thumbstick has mass. Picking the machine up, or knocking it, throws
+        # the stick past the deadzone for a few tens of milliseconds -- which
+        # reads exactly like a motion sensor scrolling the page. A deliberate
+        # scroll is *held*, so require the deflection to persist before acting.
+        now = time.monotonic()
+        if self.scroll_since is None:
+            self.scroll_since = now
+        if (now - self.scroll_since) * 1000.0 < scroll.get("engage_ms", 0):
+            return
+
+        sign = 1.0 if scroll.get("natural") else -1.0
+        self.virtual.scroll(vertical * scroll["max_speed"] * sign * dt,
+                            horizontal * scroll["max_speed"] * dt)
+
+    def moving(self) -> bool:
+        """True when the tick loop has real work to do.
+
+        Polling at 200 Hz all day would cost battery for nothing: the pad is
+        idle most of the time, and an input event wakes select() immediately
+        anyway. So run fast only while a stick is off centre or a hold is being
+        timed.
+        """
+        if self.legion_since is not None:
+            return True
+        if self.mode != "desktop":
+            return False
+        cursor_dz = self.cfg["cursor"]["deadzone"]
+        if (abs(self.norm(e.ABS_X)) > cursor_dz
+                or abs(self.norm(e.ABS_Y)) > cursor_dz):
+            return True
+        if not self.cfg["scroll"].get("enabled", True):
+            return False
+        scroll_dz = self.cfg["scroll"]["deadzone"]
+        return (abs(self.norm(e.ABS_RX)) > scroll_dz
+                or abs(self.norm(e.ABS_RY)) > scroll_dz)
+
+    # -- main loop ---------------------------------------------------------
+
+    def open_device(self, selector: selectors.BaseSelector) -> bool:
+        dev = find_device()
+        if not dev:
+            return False
+        self.dev = dev
+        self.grabbed = False
+        self.log(f"using {dev.path} ({dev.name})")
+        selector.register(dev.fd, selectors.EVENT_READ, "pad")
+        # A fresh handle is never grabbed, so re-assert the mode we are in.
+        self.set_grab(self.mode == "desktop")
+        return True
+
+    def drop_device(self, selector: selectors.BaseSelector) -> None:
+        if not self.dev:
+            return
+        try:
+            selector.unregister(self.dev.fd)
+        except (KeyError, ValueError):
+            pass
+        try:
+            self.dev.close()
+        except OSError:
+            pass
+        self.log("pad disappeared, waiting for it to come back")
+        self.dev = None
+        self.grabbed = False
+        self.virtual.release_all()
+        self.down.clear()
+
+    def run(self) -> int:
+        selector = selectors.DefaultSelector()
+        selector.register(self.control, selectors.EVENT_READ, "control")
+
+        idle_tick = 0.05
+        last_tick = time.monotonic()
+        last_scan = last_hypr_try = 0.0
+
+        while self.running:
+            now = time.monotonic()
+            if self.dev is None and now - last_scan > 2.0:
+                last_scan = now
+                self.open_device(selector)
+
+            # Hyprland may not be up yet, and it can be restarted under us.
+            if self.hypr.events is None and now - last_hypr_try > 2.0:
+                last_hypr_try = now
+                sock = self.hypr.connect()
+                if sock:
+                    selector.register(sock, selectors.EVENT_READ, "hypr")
+                    self.log("attached to Hyprland IPC")
+                    self.evaluate_window()
+                elif self.auto_mode != "desktop":
+                    # Without IPC we cannot tell a game from the desktop; the
+                    # useful default is to keep working as a mouse.
+                    self.auto_mode = "desktop"
+                    self.apply_mode()
+
+            # Read the rate every pass so `set cursor.tick_hz` applies live.
+            fast_tick = 1.0 / max(30, int(self.cfg["cursor"]["tick_hz"]))
+            tick_interval = fast_tick if self.moving() else idle_tick
+            timeout = max(0.0, tick_interval - (now - last_tick))
+            for key, _ in selector.select(timeout):
+                if key.data == "pad":
+                    try:
+                        for event in self.dev.read():
+                            self.handle_event(event)
+                    except OSError as exc:
+                        if exc.errno in (errno.ENODEV, errno.EIO):
+                            self.drop_device(selector)
+                        else:
+                            raise
+                elif key.data == "control":
+                    self.handle_control()
+                elif key.data == "hypr":
+                    lines = self.hypr.read_events()
+                    if self.hypr.events is None:
+                        selector.unregister(key.fileobj)
+                        self.log("Hyprland IPC closed; will retry")
+                    if any(line.split(">>")[0] in
+                           ("activewindow", "activewindowv2", "fullscreen", "closewindow", "openwindow")
+                           for line in lines):
+                        self.evaluate_window()
+
+            now = time.monotonic()
+            if now - last_tick >= tick_interval:
+                self.tick(now - last_tick)
+                last_tick = now
+
+        self.shutdown(selector)
+        return 0
+
+    def shutdown(self, selector: selectors.BaseSelector) -> None:
+        self.log("shutting down")
+        self.set_grab(False)
+        self.virtual.close()
+        if self.dev:
+            try:
+                self.dev.close()
+            except OSError:
+                pass
+        selector.close()
+        try:
+            os.unlink(control_path())
+        except FileNotFoundError:
+            pass
+
+    def stop(self, *_args) -> None:
+        self.running = False
+
+
+# --------------------------------------------------------------------------- probe
+
+
+def cmd_probe() -> int:
+    dev = find_device()
+    if not dev:
+        print("legion-nav: no Legion Go S pad found (looked for 1a86:e310)")
+        return 1
+    print(f"Reading {dev.path} ({dev.name}). Press controls; Ctrl-C to stop.")
+    print("Sticks and triggers are noisy by design -- watch the button lines.\n", flush=True)
+    try:
+        for event in dev.read_loop():
+            if event.type == e.EV_KEY:
+                label = CODE_TO_BUTTON.get(event.code, "?")
+                state = {0: "release", 1: "press", 2: "repeat"}.get(event.value, event.value)
+                print(f"BUTTON  code={event.code:<4} legion-nav name={label:<8} {state}", flush=True)
+            elif event.type == e.EV_ABS:
+                name = e.ABS.get(event.code, event.code)
+                if event.code in (e.ABS_HAT0X, e.ABS_HAT0Y, e.ABS_Z, e.ABS_RZ):
+                    print(f"AXIS    {name:<12} value={event.value}", flush=True)
+    except KeyboardInterrupt:
+        print()
+    return 0
+
+
+# --------------------------------------------------------------------------- cli
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="legion-nav", description=__doc__.splitlines()[0])
+    parser.add_argument("-c", "--config", help="path to config.toml")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument(
+        "command", nargs="?", default="daemon",
+        choices=["daemon", "probe", "toggle", "on", "off", "auto", "status",
+                 "config", "reload"],
+    )
+    args = parser.parse_args(argv)
+
+    if args.command == "probe":
+        return cmd_probe()
+
+    if args.command == "config":
+        # Prefer the running daemon, so live-tuned values are reflected. Fall
+        # back to reading the file when nothing is running.
+        try:
+            print(send_command("config"))
+        except SystemExit:
+            print(json.dumps(load_config(args.config)))
+        return 0
+    if args.command != "daemon":
+        print(send_command(args.command))
+        return 0
+
+    try:
+        cfg = load_config(args.config)
+    except (OSError, ValueError) as exc:
+        print(f"legion-nav: bad config: {exc}")
+        return 1
+
+    nav = Nav(cfg, verbose=args.verbose, config_path=args.config)
+    signal.signal(signal.SIGINT, nav.stop)
+    signal.signal(signal.SIGTERM, nav.stop)
+    return nav.run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

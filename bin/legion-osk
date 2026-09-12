@@ -1,0 +1,29 @@
+#!/bin/bash
+# Toggle the wvkbd on-screen keyboard.
+#
+# Same approach as ~/.local/bin/lock-with-kb: --non-exclusive so the keyboard
+# layer does not swallow input meant for the window underneath, which is what
+# lets you keep driving the cursor with the stick while typing.
+set -euo pipefail
+
+HEIGHT="${LEGION_OSK_HEIGHT:-250}"
+
+case "${1:-toggle}" in
+  toggle)
+    if pgrep -x wvkbd-mobintl >/dev/null; then
+      pkill -x wvkbd-mobintl
+    else
+      setsid -f wvkbd-mobintl -L "$HEIGHT" --non-exclusive >/dev/null 2>&1
+    fi
+    ;;
+  show)
+    pgrep -x wvkbd-mobintl >/dev/null || setsid -f wvkbd-mobintl -L "$HEIGHT" --non-exclusive >/dev/null 2>&1
+    ;;
+  hide)
+    pkill -x wvkbd-mobintl || true
+    ;;
+  *)
+    echo "usage: legion-osk [toggle|show|hide]" >&2
+    exit 1
+    ;;
+esac

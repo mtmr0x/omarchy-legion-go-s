@@ -1,0 +1,7 @@
+# Let the 'input' group open /dev/uinput, so legion-nav can create its virtual
+# mouse and keyboard without running as root.
+#
+# Arch ships /dev/uinput as root:root 0600 and has no rule of its own. The
+# static_node option applies the same ownership when the module is loaded on
+# demand rather than hotplugged.
+KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"
