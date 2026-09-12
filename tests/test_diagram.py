@@ -33,15 +33,22 @@ print("\n1. the art is rectangular")
 check("all rows the same width", len({len(line) for line in lines}), 1)
 check("at least the minimum width", len(lines[0]) >= LC.MIN_DIAGRAM_WIDTH, True)
 
-print("\n2. every bindable control appears, exactly once")
-check("span count matches control count", len(spans), len(LC.CONTROL_NAMES))
-check("no control is missing", sorted(spans), sorted(LC.CONTROL_NAMES))
-for control in LC.CONTROL_NAMES:
+print("\n2. every drawn control appears, exactly once")
+check("span count matches label count", len(spans), len(LC.LABELS))
+check("no drawn control is missing", sorted(spans), sorted(LC.LABELS))
+for control in LC.LABELS:
     label = LC.LABELS[control]
     occurrences = sum(line.count(label) for line in lines)
     if control in ("a", "b", "x", "y"):
         continue          # single letters also occur inside SEL/STA/LGN
     check(f"{control} drawn once", occurrences, 1)
+
+print("\n2b. controls that are not drawn are still bindable")
+for control in LC.NOT_ON_DIAGRAM:
+    check(f"{control} absent from the art", control not in spans, True)
+    check(f"{control} still editable", control in LC.CONTROL_NAMES, True)
+check("drawn controls are all real controls",
+      set(LC.LABELS) <= set(LC.CONTROL_NAMES), True)
 
 print("\n3. each span points at its own label")
 for control, (row, col, size) in sorted(spans.items()):

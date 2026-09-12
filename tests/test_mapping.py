@@ -127,17 +127,13 @@ nav.tick(0.1)                                  # 100 ms at full deflection
 moves = [(c, v) for t, c, v in ptr.log if t == e.EV_REL]
 check("moved right and up by ~150px", moves, [(e.REL_X, 150), (e.REL_Y, -150)])
 
-print("\n7b. right-stick scroll is OFF by default")
+print("\n7b. scroll is on by default, but a knock is ignored")
 # Picking the machine up throws the stick past any deadzone from sheer inertia,
-# which scrolled the page on its own. Default is now off.
-ptr.log.clear()
+# which scrolled the page on its own. engage_ms is what separates that from a
+# deliberate scroll, so the feature ships on with the delay rather than off.
+check("enabled in the shipped config", cfg["scroll"]["enabled"], True)
 nav.axes[e.ABS_X] = nav.axes[e.ABS_Y] = 0
 nav.axes[e.ABS_RY] = -32768                    # stick fully up
-nav.tick(1.0)
-check("no scroll emitted", [(c, v) for t, c, v in ptr.log if t == e.EV_REL], [])
-
-print("\n7c. when enabled, a knock is ignored but a held push scrolls")
-nav.cfg["scroll"]["enabled"] = True
 nav.scroll_since = None
 
 # A transient deflection -- shorter than engage_ms -- must produce nothing.
@@ -145,6 +141,8 @@ ptr.log.clear()
 nav.tick(0.005)
 nav.tick(0.005)
 check("brief deflection ignored", [(c, v) for t, c, v in ptr.log if t == e.EV_REL], [])
+
+print("\n7c. a deflection held past engage_ms scrolls normally")
 
 # Held past engage_ms, it scrolls normally.
 ptr.log.clear()
@@ -161,7 +159,17 @@ check("scrolls up (positive)", hi > 0, True)
 nav.axes[e.ABS_RY] = 0
 nav.tick(0.005)
 check("delay re-armed on release", nav.scroll_since, None)
+
+print("\n7d. disabling it silences the right stick entirely")
 nav.cfg["scroll"]["enabled"] = False
+nav.axes[e.ABS_RY] = -32768
+nav.scroll_since = None
+ptr.log.clear()
+nav.tick(1.0)
+nav.tick(1.0)
+check("nothing emitted", [(c, v) for t, c, v in ptr.log if t == e.EV_REL], [])
+check("delay state cleared", nav.scroll_since, None)
+nav.axes[e.ABS_RY] = 0
 
 print("\n8. precision mode (R3) slows the cursor")
 nav.axes[e.ABS_RY] = 0
@@ -186,7 +194,11 @@ check("no pointer output", ptr.log, [])
 check("no key output", kb.log, [])
 check("no commands run", nav.spawned, [])
 
-print("\n10. Legion hold still toggles out of game mode")
+print("\n10. holding Legion toggles out of game mode")
+# This is the only escape hatch that works from inside a game: in game mode the
+# pad is released, so nothing else the daemon does is running.
+check("bound in the shipped config",
+      mod.build_actions(cfg).get("legion").value, "mode_hold")
 nav.handle_event(ev(e.EV_KEY, e.BTN_MODE, 1))
 check("hold timer armed", nav.legion_since is not None, True)
 nav.legion_since = time.monotonic() - 1.0      # pretend it has been held

@@ -63,13 +63,24 @@ check("bool is lowercase", (LC.format_value(True), LC.format_value(False)), ("tr
 check("string is quoted", LC.format_value("exec:a b"), '"exec:a b"')
 
 print("\n4. a commented-out example is never mistaken for the setting")
-# The [scroll] block's prose literally contains "set enabled = true".
-out = LC.set_in_toml(ORIGINAL, "scroll", "enabled", True)
-check("prose line untouched", "# To get scrolling back, set enabled = true." in out
-      or "set enabled = true" in ORIGINAL, True)
+# Built as a fixture rather than leaning on the shipped prose, so rewording a
+# comment in the real config cannot quietly retire this check.
+fixture = (
+    "[scroll]\n"
+    "# Set enabled = true to turn this back on.\n"
+    "#   enabled = true\n"
+    "enabled = false\n"
+    "deadzone = 0.35\n"
+)
+out = LC.set_in_toml(fixture, "scroll", "enabled", True)
 check("the real key changed", tomllib.loads(out)["scroll"]["enabled"], True)
-check("still exactly one changed line",
-      sum(1 for x, y in zip(ORIGINAL.splitlines(), out.splitlines()) if x != y), 1)
+check("both comment lines survive verbatim",
+      [l for l in out.splitlines() if l.startswith("#")],
+      [l for l in fixture.splitlines() if l.startswith("#")])
+check("exactly one line changed",
+      sum(1 for x, y in zip(fixture.splitlines(), out.splitlines()) if x != y), 1)
+check("the changed line is the real assignment",
+      [l for l in out.splitlines() if l == "enabled = true"], ["enabled = true"])
 
 print("\n5. a missing key is inserted into the right section")
 text = LC.set_in_toml(ORIGINAL.replace("precision_factor = 0.3\n", ""),

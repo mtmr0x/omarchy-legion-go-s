@@ -85,11 +85,12 @@ def scratch():
 
 
 print("\n1. the main screen renders on the handheld panel (128x30)")
+# Select and Legion are bindable but deliberately not drawn.
 cfg = scratch()
 text, code = run(cfg, [b"q"])
 for want in ["legion-nav", "Buttons", "Feel", "Save", "Revert", "Quit"]:
     check(f"shows {want!r}", want in text)
-for want in ["LB", "RB", "LT", "RT", "SEL", "STA", "LGN", "L3", "R3", "╭", "╰"]:
+for want in ["LB", "RB", "LT", "RT", "STA", "L3", "R3", "▲", "╭", "╰"]:
     check(f"diagram has {want!r}", want in text)
 check("bindings are described in words", "On-screen keyboard" in text)
 check("quits on q", code == 0)
@@ -139,7 +140,7 @@ print("\n7. --print works with no terminal at all")
 out = subprocess.run(["python3", str(REPO / "bin" / "legion-config"), "-c", cfg, "--print"],
                      capture_output=True, text=True)
 check("exit 0", out.returncode == 0)
-check("diagram present", "╭" in out.stdout and "LGN" in out.stdout)
+check("diagram present", "╭" in out.stdout and "STA" in out.stdout)
 check("all 17 controls listed", out.stdout.count("\n  ") >= 17)
 
 print("\n" + ("ALL PASS" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))

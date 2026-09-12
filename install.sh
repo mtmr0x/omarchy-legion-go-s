@@ -203,4 +203,4 @@ echo
 echo "   Left stick moves the cursor, right stick scrolls, D-pad is arrows."
 echo "   A left-clicks, B right-clicks, X opens the keyboard, Y is Enter."
 echo "   LT is Escape, RT opens the Window menu."
-echo "   Hold the Legion button to force desktop/game mode."
+echo "   Hold the Legion button (or SUPER+SHIFT+G) to toggle desktop/game mode."

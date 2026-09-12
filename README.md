@@ -27,7 +27,7 @@ still works from inside a game.
 | Control | Desktop action |
 |---|---|
 | **Left stick** | Move the cursor |
-| **Right stick** | Nothing by default — see below |
+| **Right stick** | Scroll — held, not nudged (see below) |
 | **D-pad** | Arrow keys |
 | **A** | Left click |
 | **B** | Right click |
@@ -39,7 +39,7 @@ still works from inside a game.
 | **L3** (left stick click) | Middle click |
 | **R3** (right stick click) | Hold for precision — cursor at 30% speed |
 | **Start** | Open the Omarchy menu |
-| **Select** | Super (Omarchy overview) |
+| **Select** | *unbound* |
 | **Legion** | Hold ~0.6 s to force desktop/game mode |
 
 Change any of it with `legion-config` (see below) rather than editing TOML.
@@ -196,7 +196,7 @@ mode. A window counts as a game when any of these is true:
 
 The fullscreen rule is the one that catches games you have not listed. If it
 misfires — a fullscreen video player, say — add that class to `desktop_classes`,
-or just hold the Legion button.
+or hold the Legion button, or use `SUPER + SHIFT + G` / `legion-nav toggle`.
 
 A manual override lasts until you toggle again or focus moves to a different
 window class, so it never silently sticks.
@@ -277,7 +277,7 @@ No hardware needed for any of them.
 - **`keyd`** is running but `/etc/keyd/default.conf` already excludes
   `1a86:e310`, so there is no conflict.
 
-## Why the right stick does nothing
+## Why scrolling needs a held push
 
 **Picking the machine up scrolled the page.** It really did, and it looks for all
 the world like a motion sensor — but there is no gyroscope and no accelerometer
@@ -287,13 +287,16 @@ The cause is simpler: **a thumbstick has mass.** Lifting the device off a table,
 or just gripping it firmly, deflects the right stick — measured at close to
 *full* deflection, not a slight nudge. The stick is, in effect, an accelerometer.
 
-No deadzone alone fixes that, so right-stick scrolling ships **off**. Set
-`enabled = true` under `[scroll]` to get it back, and two safeguards apply:
+A deadzone alone cannot fix that, so scrolling is gated on **time** instead:
 
-- `deadzone = 0.35` — far larger than the cursor's.
 - `engage_ms = 150` — the stick must be *held* past the deadzone this long
   before scrolling starts. An inertial knock is over in tens of milliseconds; a
   deliberate scroll is not. Returning to centre re-arms it.
+- `deadzone = 0.35` — far larger than the cursor's, as a second layer.
+
+You will feel a brief pause before a scroll begins; that is the delay doing its
+job. Raise `engage_ms` if a knock still gets through, lower it if the pause
+annoys, or set `enabled = false` to silence the right stick completely.
 
 Diagnosed with `tools/inputcapture.py`, which is worth keeping for any
 "what just did that?" input mystery.

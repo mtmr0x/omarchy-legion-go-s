@@ -83,30 +83,37 @@ FEEL = [
 
 # --------------------------------------------------------------------------- diagram
 
+# Only controls whose position on the device is unambiguous get drawn. Select
+# and Legion stay bindable and appear in the list, but are not pictured -- see
+# NOT_ON_DIAGRAM.
 LABELS = {
     "lb": "LB", "rb": "RB", "lt": "LT", "rt": "RT",
     "dpad_up": "▲", "dpad_down": "▼", "dpad_left": "◄", "dpad_right": "►",
     "y": "Y", "x": "X", "b": "B", "a": "A",
-    "select": "SEL", "start": "STA", "legion": "LGN",
-    "l3": "L3", "r3": "R3",
+    "start": "STA", "l3": "L3", "r3": "R3",
 }
+
+NOT_ON_DIAGRAM = ("select", "legion")
 
 # Rows are padded to a common width at render time via the {~} (spaces) and
 # {-} (dashes) stretch tokens, so the art cannot drift out of alignment when a
 # label changes length. Nothing here is hand-counted.
+# Exactly one stretch token per row, placed so that everything after it sits at
+# a fixed offset from the right wall. That is what keeps the face diamond
+# aligned: Y and A land on the midpoint between X and B by construction.
 TEMPLATE = [
     "     {lb}{~}{rb}     ",
     "     {lt}{~}{rt}     ",
     "   ╭{-}╮   ",
-    "   │  {dpad_up}{~}{y}{~}  │   ",
-    "   │ {dpad_left} {dpad_right}{~}{x}   {b}{~} │   ",
-    "   │  {dpad_down}{~}{a}{~}  │   ",
-    "   │ {l3}{~}{select}  {legion}  {start}{~}{r3} │   ",
+    "   │  {dpad_up}{~}{y}   │   ",
+    "   │ {dpad_left} {dpad_right}{~}{start}   {x}   {b} │   ",
+    "   │  {dpad_down}{~}{a}   │   ",
+    "   │  {l3}{~}{r3}     │   ",
     "   ╰{-}╯   ",
 ]
 
 # Minimum interior width, so the art never collapses into a cramped row.
-MIN_DIAGRAM_WIDTH = 40
+MIN_DIAGRAM_WIDTH = 44
 
 _TOKEN = re.compile(r"\{([a-z0-9_~-]+)\}")
 
@@ -551,7 +558,7 @@ class App:
         notes = []
         bindings = {c: binding_of(self.cfg, c) for c, _ in CONTROLS}
         if "special:mode_hold" not in bindings.values():
-            notes.append("nothing toggles desktop/game mode — you'll need the CLI to get back")
+            notes.append("no on-device mode toggle — use SUPER+SHIFT+G or `legion-nav toggle`")
         if "btn:BTN_LEFT" not in bindings.values():
             notes.append("nothing left-clicks")
         return notes

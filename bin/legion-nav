@@ -123,7 +123,7 @@ DEFAULT_CONFIG = {
         "tick_hz": 200,
     },
     "scroll": {
-        "enabled": False,
+        "enabled": True,
         "max_speed": 18.0,
         "deadzone": 0.35,
         "expo": 2.0,

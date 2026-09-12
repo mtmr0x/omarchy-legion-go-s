@@ -35,7 +35,15 @@ r3     = "special:precision"
 
 # System buttons.
 start  = "exec:omarchy-menu"
-select = "key:KEY_LEFTMETA"
+
+# Neither of these is drawn on the legion-config diagram: their physical
+# location on this unit is unclear, and the driver declares BTN_SELECT/BTN_MODE
+# whether or not the hardware actually emits them. Run `legion-nav probe` and
+# press them to find out which, if either, your unit sends.
+#
+# Legion keeps the mode toggle because it is the only on-device way out of game
+# mode -- in game mode the pad is released, so no other binding is running.
+select = "none"
 legion = "special:mode_hold"
 
 [dpad_keys]
@@ -67,19 +75,17 @@ precision_factor = 0.3
 tick_hz = 200
 
 [scroll]
-# Right-stick scrolling is OFF.
+# Right-stick scrolling, with two safeguards.
 #
 # A thumbstick has mass, so picking the machine up off a table -- or just
 # gripping it firmly -- throws the stick well past any sane deadzone for a
 # moment. The page then scrolls on its own, which feels exactly like a motion
 # sensor doing it. Measured peaks while lifting the device were near FULL
-# deflection, so no deadzone alone is enough.
+# deflection, so a deadzone alone is not enough; engage_ms below is what
+# actually separates a knock from a deliberate scroll.
 #
-# To get scrolling back, set enabled = true. The safeguards below then apply:
-# a much larger deadzone, plus a delay that the stick must be held past that
-# deadzone before scrolling starts. A knock is over in tens of milliseconds; a
-# real scroll is held, so the delay separates them cleanly.
-enabled = false
+# Set this to false to turn the right stick off entirely.
+enabled = true
 
 # Scroll notches per second at full deflection of the right stick.
 max_speed = 18.0
@@ -115,7 +121,7 @@ fullscreen_is_game = true
 # Trust the Wayland content-type hint when a client sets contentType = "game".
 content_type_is_game = true
 
-# How long to hold the Legion button to force a mode switch.
+# How long the Legion button must be held to force a mode switch.
 mode_hold_seconds = 0.6
 
 # Window classes that always mean game mode. Case-insensitive, glob patterns.
